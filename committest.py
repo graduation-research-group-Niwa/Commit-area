@@ -1,1 +1,2 @@
 #testdayo
+print("こんにちは、Pythonです！")

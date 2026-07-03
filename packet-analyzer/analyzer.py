@@ -60,12 +60,16 @@ class PacketAnalyzer:
     def _capture_loop(self, iface):
         """Scapyのsniff()をブロッキングで回すスレッド本体"""
         try:
-            sniff(
-                iface=iface,
-                prn=self._on_packet,      # パケット到着ごとに呼ばれるコールバック
-                store=False,               # Scapy内部にはためない（自前でraw_packetsに保持）
-                stop_filter=lambda _: not self.running,
-            )
+            while self.running:
+                # timeoutを短く切ることで、パケットが来ない間も
+                # 定期的にループへ戻り self.running を再チェックできるようにする
+                sniff(
+                    iface=iface,
+                    prn=self._on_packet,
+                    store=False,
+                    timeout=1,  # 1秒ごとに一度sniff()を抜けてrunningを再確認
+                    stop_filter=lambda _: not self.running,
+                )
         except PermissionError:
             self.packet_queue.put({
                 "error": "権限エラー: 管理者権限(sudo)で実行してください"

@@ -25,16 +25,53 @@ from explanations import FIELD_EXPLANATIONS, get_flag_explanations, get_port_exp
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("パケットアナライザ - プロトコル学習支援ツール")
+        self.title("Packet Analyzer - Protocol Learning Tool")
         self.geometry("1080x680")
         self.minsize(900, 560)
+
+        # 日本語表示のためのデフォルトフォント設定
+        # WSL2 / Windows環境では明示的に指定しないと文字化けすることがある
+        self._setup_fonts()
 
         self.analyzer = PacketAnalyzer()
         self.packets: list[dict] = []
         self.proto_counter = Counter()
+        self._poll_job = None  # after()の予約IDを保持し、終了時に確実にキャンセルする
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)  # ウィンドウを閉じる際の後片付けを登録
         self._poll_queue()
+
+    # ------------------------------------------------------------------
+    # フォント設定
+    # ------------------------------------------------------------------
+    def _setup_fonts(self):
+        """環境に応じて日本語表示可能なフォントを選び、Tk全体のデフォルトに適用する"""
+        import tkinter.font as tkfont
+
+        available = set(tkfont.families())
+        # 優先順位順に候補を並べる（Windows/WSL2/Linuxいずれでも動くよう複数用意）
+        candidates = [
+            "Yu Gothic UI", "Yu Gothic", "Meiryo UI", "Meiryo",
+            "MS Gothic", "Noto Sans CJK JP", "Takao Gothic", "IPAGothic",
+        ]
+        self.jp_font_family = next((f for f in candidates if f in available), None)
+
+        if self.jp_font_family is None:
+            # 候補が1つも見つからない場合はTkの既定フォントのまま進める
+            self.mono_font_family = "TkFixedFont"
+            return
+
+        # ボタンやラベルなど標準ウィジェット全体のデフォルトフォントを差し替える
+        default_font = tkfont.nametofont("TkDefaultFont")
+        default_font.configure(family=self.jp_font_family, size=10)
+        text_font = tkfont.nametofont("TkTextFont")
+        text_font.configure(family=self.jp_font_family, size=10)
+        menu_font = tkfont.nametofont("TkMenuFont")
+        menu_font.configure(family=self.jp_font_family, size=10)
+
+        # 詳細パネル（等幅表示したいが日本語も含むため等幅フォントは使わない）
+        self.mono_font_family = self.jp_font_family
 
     # ------------------------------------------------------------------
     # UI構築
@@ -99,6 +136,10 @@ class App(tk.Tk):
             "proto": 50, "flags": 90, "ttl": 40, "len": 50,
         }
 
+        style = ttk.Style()
+        style.configure("Treeview", font=(self.mono_font_family, 10), rowheight=22)
+        style.configure("Treeview.Heading", font=(self.mono_font_family, 10, "bold"))
+
         self.tree = ttk.Treeview(parent, columns=cols, show="headings", height=24)
         for c in cols:
             self.tree.heading(c, text=headers[c])
@@ -117,7 +158,10 @@ class App(tk.Tk):
 
     def _build_detail_panel(self, parent):
         tk.Label(parent, text="パケット詳細", font=("", 11, "bold")).pack(anchor="w", pady=(0, 4))
-        self.detail_text = tk.Text(parent, height=16, state="disabled", font=("Courier New", 10), wrap="word")
+        self.detail_text = tk.Text(
+            parent, height=16, state="disabled", wrap="word",
+            font=(self.mono_font_family, 10),
+        )
         self.detail_text.pack(fill="x")
 
         tk.Label(parent, text="プロトコル割合", font=("", 11, "bold")).pack(anchor="w", pady=(12, 4))
@@ -188,7 +232,20 @@ class App(tk.Tk):
                 self._add_row(pkt)
         except Exception:
             pass
-        self.after(150, self._poll_queue)  # 150ms間隔でキューを確認
+        # 150ms間隔でキューを確認。IDを保持し、ウィンドウ終了時にキャンセルできるようにする
+        self._poll_job = self.after(150, self._poll_queue)
+
+    def _on_close(self):
+        """ウィンドウを閉じる際の後片付け。予約済みのafter()を確実にキャンセルしてから終了する"""
+        if self._poll_job is not None:
+            self.after_cancel(self._poll_job)
+            self._poll_job = None
+        self.analyzer.stop()
+        self.destroy()
+        # daemonスレッド(Scapyのキャプチャ)がすぐに終わらない場合があるため、
+        # ウィンドウを破棄したらプロセスも明示的に終了させる
+        import os
+        os._exit(0)
 
     def _add_row(self, pkt: dict):
         self.packets.append(pkt)

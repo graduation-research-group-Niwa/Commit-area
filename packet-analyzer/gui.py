@@ -1,17 +1,25 @@
 """
 gui.py
-Tkinterによるデスクトップアプリケーション画面
+CustomTkinterによるデスクトップアプリケーション画面
 
 役割:
   - パケット一覧のリアルタイム表示
   - パケット詳細の表示（学習支援解説つき）
   - プロトコル割合グラフの表示
   - キャプチャの開始・停止、pcap保存・読み込み
+
+注意:
+  CustomTkinterはボタン・ラベル・入力欄など「見た目」に関わる部分を担当する。
+  一覧表（Treeview）はCustomTkinterに専用ウィジェットがないため、
+  標準Tkinter(ttk)のTreeviewをそのまま使い、スタイルだけ合わせている。
 """
 
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from collections import Counter
+
+import customtkinter as ctk
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -21,57 +29,51 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from analyzer import PacketAnalyzer
 from explanations import FIELD_EXPLANATIONS, get_flag_explanations, get_port_explanation
 
+# CustomTkinterの見た目設定（アプリ起動前に一度だけ行う）
+ctk.set_appearance_mode("light")       # "light" / "dark" / "system"
+ctk.set_default_color_theme("blue")    # ボタンなどのアクセントカラー
 
-class App(tk.Tk):
+
+class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Packet Analyzer - Protocol Learning Tool")
         self.geometry("1080x680")
         self.minsize(900, 560)
 
-        # 日本語表示のためのデフォルトフォント設定
-        # WSL2 / Windows環境では明示的に指定しないと文字化けすることがある
+        # 日本語表示のためのフォント設定
         self._setup_fonts()
 
         self.analyzer = PacketAnalyzer()
         self.packets: list[dict] = []
         self.proto_counter = Counter()
-        self._poll_job = None  # after()の予約IDを保持し、終了時に確実にキャンセルする
+        self._poll_job = None
 
         self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)  # ウィンドウを閉じる際の後片付けを登録
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_queue()
 
     # ------------------------------------------------------------------
     # フォント設定
     # ------------------------------------------------------------------
     def _setup_fonts(self):
-        """環境に応じて日本語表示可能なフォントを選び、Tk全体のデフォルトに適用する"""
+        """環境に応じて日本語表示可能なフォントを選び、CTkFontとして用意する"""
         import tkinter.font as tkfont
 
         available = set(tkfont.families())
-        # 優先順位順に候補を並べる（Windows/WSL2/Linuxいずれでも動くよう複数用意）
         candidates = [
             "Yu Gothic UI", "Yu Gothic", "Meiryo UI", "Meiryo",
             "MS Gothic", "Noto Sans CJK JP", "Takao Gothic", "IPAGothic",
         ]
-        self.jp_font_family = next((f for f in candidates if f in available), None)
+        family = next((f for f in candidates if f in available), None)
+        self.jp_font_family = family or "TkDefaultFont"
 
-        if self.jp_font_family is None:
-            # 候補が1つも見つからない場合はTkの既定フォントのまま進める
-            self.mono_font_family = "TkFixedFont"
-            return
-
-        # ボタンやラベルなど標準ウィジェット全体のデフォルトフォントを差し替える
-        default_font = tkfont.nametofont("TkDefaultFont")
-        default_font.configure(family=self.jp_font_family, size=10)
-        text_font = tkfont.nametofont("TkTextFont")
-        text_font.configure(family=self.jp_font_family, size=10)
-        menu_font = tkfont.nametofont("TkMenuFont")
-        menu_font.configure(family=self.jp_font_family, size=10)
-
-        # 詳細パネル（等幅表示したいが日本語も含むため等幅フォントは使わない）
-        self.mono_font_family = self.jp_font_family
+        # CustomTkinterのウィジェットは各自にフォントを渡す必要があるため、
+        # 用途別にCTkFontインスタンスを作っておき、以降はこれを使い回す
+        self.font_normal = ctk.CTkFont(family=self.jp_font_family, size=13)
+        self.font_bold = ctk.CTkFont(family=self.jp_font_family, size=13, weight="bold")
+        self.font_heading = ctk.CTkFont(family=self.jp_font_family, size=15, weight="bold")
+        self.font_mono = ctk.CTkFont(family=self.jp_font_family, size=12)
 
     # ------------------------------------------------------------------
     # UI構築
@@ -79,53 +81,92 @@ class App(tk.Tk):
     def _build_ui(self):
         self._build_toolbar()
 
-        pane = tk.PanedWindow(self, orient="horizontal", sashwidth=6)
+        # 左右分割はCustomTkinterに専用ウィジェットがないため、
+        # 標準TkinterのPanedWindowをそのまま使い、中身をCTkFrameにする
+        pane = tk.PanedWindow(self, orient="horizontal", sashwidth=6, bg="#dbdbdb")
         pane.pack(fill="both", expand=True, padx=10, pady=(4, 10))
 
-        left = tk.Frame(pane)
+        left = ctk.CTkFrame(pane, corner_radius=8)
         pane.add(left, minsize=480)
         self._build_packet_table(left)
 
-        right = tk.Frame(pane, width=340)
+        right = ctk.CTkFrame(pane, corner_radius=8, width=340)
         pane.add(right, minsize=300)
         self._build_detail_panel(right)
 
     def _build_toolbar(self):
-        bar = tk.Frame(self, pady=8)
-        bar.pack(fill="x", padx=10)
+        bar = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        bar.pack(fill="x", padx=10, pady=(10, 4))
 
-        self.btn_start = tk.Button(bar, text="\u25b6 開始", width=10, command=self._start)
-        self.btn_start.pack(side="left", padx=(0, 4))
+        self.btn_start = ctk.CTkButton(
+            bar, text="\u25b6 開始", width=90, font=self.font_normal, command=self._start,
+        )
+        self.btn_start.pack(side="left", padx=(0, 6))
 
-        self.btn_stop = tk.Button(bar, text="\u25a0 停止", width=10, command=self._stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=4)
+        self.btn_stop = ctk.CTkButton(
+            bar, text="\u25a0 停止", width=90, font=self.font_normal, command=self._stop,
+            state="disabled", fg_color="#B4433B", hover_color="#8F332C",
+        )
+        self.btn_stop.pack(side="left", padx=6)
 
-        tk.Frame(bar, width=1, bg="#ccc").pack(side="left", fill="y", padx=8)
+        ctk.CTkFrame(bar, width=2, height=28, fg_color="#d0d0d0").pack(side="left", padx=10)
 
-        tk.Button(bar, text="pcap保存", width=10, command=self._save_pcap).pack(side="left", padx=4)
-        tk.Button(bar, text="pcap読込", width=10, command=self._load_pcap).pack(side="left", padx=4)
+        ctk.CTkButton(
+            bar, text="pcap保存", width=90, font=self.font_normal,
+            fg_color="#5A5A5A", hover_color="#454545", command=self._save_pcap,
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            bar, text="pcap読込", width=90, font=self.font_normal,
+            fg_color="#5A5A5A", hover_color="#454545", command=self._load_pcap,
+        ).pack(side="left", padx=6)
 
-        tk.Frame(bar, width=1, bg="#ccc").pack(side="left", fill="y", padx=8)
+        ctk.CTkFrame(bar, width=2, height=28, fg_color="#d0d0d0").pack(side="left", padx=10)
 
-        # フィルタ
-        tk.Label(bar, text="フィルタ:").pack(side="left")
+        ctk.CTkLabel(bar, text="フィルタ:", font=self.font_normal).pack(side="left")
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *_: self._apply_filter())
-        tk.Entry(bar, textvariable=self.filter_var, width=18).pack(side="left", padx=4)
+        ctk.CTkEntry(
+            bar, textvariable=self.filter_var, width=160, font=self.font_normal,
+            placeholder_text="IP・ポートで検索",
+        ).pack(side="left", padx=6)
 
         self.proto_filter_var = tk.StringVar(value="すべて")
-        proto_combo = ttk.Combobox(
-            bar, textvariable=self.proto_filter_var, width=8, state="readonly",
+        ctk.CTkComboBox(
+            bar, variable=self.proto_filter_var, width=100, font=self.font_normal,
             values=["すべて", "TCP", "UDP", "OTHER"],
-        )
-        proto_combo.pack(side="left", padx=4)
-        proto_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_filter())
+            command=lambda _v: self._apply_filter(),
+            state="readonly",
+        ).pack(side="left", padx=6)
 
-        # ステータス
         self.status_var = tk.StringVar(value="待機中")
-        tk.Label(bar, textvariable=self.status_var, fg="gray").pack(side="right")
+        ctk.CTkLabel(
+            bar, textvariable=self.status_var, font=self.font_normal, text_color="#888888",
+        ).pack(side="right", padx=4)
 
     def _build_packet_table(self, parent):
+        # Treeviewはttkウィジェットのため、CTkのテーマではなく
+        # ttk.Styleで見た目をCustomTkinter風に近づける
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(
+            "Treeview",
+            font=(self.jp_font_family, 11),
+            rowheight=24,
+            background="#FFFFFF",
+            fieldbackground="#FFFFFF",
+            borderwidth=0,
+        )
+        style.configure(
+            "Treeview.Heading",
+            font=(self.jp_font_family, 11, "bold"),
+            background="#F0F0F0",
+            relief="flat",
+        )
+        style.map("Treeview", background=[("selected", "#3B8ED0")], foreground=[("selected", "#FFFFFF")])
+
+        table_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        table_frame.pack(fill="both", expand=True, padx=8, pady=8)
+
         cols = ("no", "time", "src", "dst", "proto", "flags", "ttl", "len")
         headers = {
             "no": "No", "time": "時刻", "src": "送信元IP", "dst": "宛先IP",
@@ -136,38 +177,42 @@ class App(tk.Tk):
             "proto": 50, "flags": 90, "ttl": 40, "len": 50,
         }
 
-        style = ttk.Style()
-        style.configure("Treeview", font=(self.mono_font_family, 10), rowheight=22)
-        style.configure("Treeview.Heading", font=(self.mono_font_family, 10, "bold"))
-
-        self.tree = ttk.Treeview(parent, columns=cols, show="headings", height=24)
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=24)
         for c in cols:
             self.tree.heading(c, text=headers[c])
             self.tree.column(c, width=widths[c], anchor="center" if c not in ("src", "dst") else "w")
         self.tree.pack(fill="both", expand=True, side="left")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
-        sb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
+        sb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
 
-        # プロトコルごとの行の色分け
         self.tree.tag_configure("TCP", background="#EAF2FB")
         self.tree.tag_configure("UDP", background="#E7F6EF")
         self.tree.tag_configure("OTHER", background="#F2F2F2")
 
     def _build_detail_panel(self, parent):
-        tk.Label(parent, text="パケット詳細", font=("", 11, "bold")).pack(anchor="w", pady=(0, 4))
-        self.detail_text = tk.Text(
-            parent, height=16, state="disabled", wrap="word",
-            font=(self.mono_font_family, 10),
-        )
-        self.detail_text.pack(fill="x")
+        ctk.CTkLabel(
+            parent, text="パケット詳細", font=self.font_heading, anchor="w",
+        ).pack(fill="x", padx=8, pady=(8, 4))
 
-        tk.Label(parent, text="プロトコル割合", font=("", 11, "bold")).pack(anchor="w", pady=(12, 4))
+        self.detail_text = ctk.CTkTextbox(
+            parent, height=340, font=self.font_mono, wrap="word",
+            state="disabled", corner_radius=6,
+        )
+        self.detail_text.pack(fill="x", padx=8, pady=(0, 8))
+
+        ctk.CTkLabel(
+            parent, text="プロトコル割合", font=self.font_heading, anchor="w",
+        ).pack(fill="x", padx=8, pady=(4, 4))
+
+        chart_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        chart_frame.pack(fill="x", padx=8, pady=(0, 8))
+
         self.fig, self.ax = plt.subplots(figsize=(3.2, 2.6))
         self.fig.tight_layout()
-        self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
         self.canvas.get_tk_widget().pack()
         self._update_chart()
 
@@ -177,14 +222,14 @@ class App(tk.Tk):
     def _start(self):
         self.analyzer.start()
         self.status_var.set("\u25cf キャプチャ中")
-        self.btn_start.config(state="disabled")
-        self.btn_stop.config(state="normal")
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
 
     def _stop(self):
         self.analyzer.stop()
         self.status_var.set("停止")
-        self.btn_start.config(state="normal")
-        self.btn_stop.config(state="disabled")
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
 
     def _save_pcap(self):
         if not self.analyzer.raw_packets:
@@ -232,11 +277,10 @@ class App(tk.Tk):
                 self._add_row(pkt)
         except Exception:
             pass
-        # 150ms間隔でキューを確認。IDを保持し、ウィンドウ終了時にキャンセルできるようにする
         self._poll_job = self.after(150, self._poll_queue)
 
     def _on_close(self):
-        """ウィンドウを閉じる際の後片付け。予約済みのafter()を確実にキャンセルしてから終了する"""
+        """ウィンドウを閉じる際の後片付け"""
         if self._poll_job is not None:
             self.after_cancel(self._poll_job)
             self._poll_job = None
@@ -244,7 +288,6 @@ class App(tk.Tk):
         self.destroy()
         # daemonスレッド(Scapyのキャプチャ)がすぐに終わらない場合があるため、
         # ウィンドウを破棄したらプロセスも明示的に終了させる
-        import os
         os._exit(0)
 
     def _add_row(self, pkt: dict):
@@ -264,7 +307,7 @@ class App(tk.Tk):
             ),
             tags=(proto,),
         )
-        self.tree.yview_moveto(1)  # 常に最新行が見えるよう自動スクロール
+        self.tree.yview_moveto(1)
         self.proto_counter[proto] += 1
         self._update_chart()
 
@@ -339,10 +382,11 @@ class App(tk.Tk):
                 lines.append(f"  \u2937 {exp}")
                 lines.append("")
 
-        self.detail_text.config(state="normal")
+        # CTkTextboxはtk.Textと同じAPIで操作できる
+        self.detail_text.configure(state="normal")
         self.detail_text.delete("1.0", "end")
         self.detail_text.insert("end", "\n".join(lines))
-        self.detail_text.config(state="disabled")
+        self.detail_text.configure(state="disabled")
 
     # ------------------------------------------------------------------
     # グラフ
@@ -350,7 +394,7 @@ class App(tk.Tk):
     def _update_chart(self):
         self.ax.clear()
         if self.proto_counter:
-            colors = {"TCP": "#378ADD", "UDP": "#1D9E75", "OTHER": "#888780"}
+            colors = {"TCP": "#3B8ED0", "UDP": "#2FA572", "OTHER": "#888888"}
             labels = list(self.proto_counter.keys())
             self.ax.pie(
                 self.proto_counter.values(),

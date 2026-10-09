@@ -1,25 +1,29 @@
 """
-学習支援パケットアナライザ - キャプチャ種類選択画面
-=====================================================
+学習パケットアナライザ - 統合版
+================================
+タイトル画面(キャプチャ種類の選択)と、パケット一覧画面を
+1つのウィンドウの中で切り替えるアプリ。
 
-このファイルは「最初にユーザーが見る画面」のUIだけを作ったものです。
-Wi-Fi / 有線LAN / ログ読み込み の3種類から選び、インターフェースを選んで
-「キャプチャ開始」ボタンを押す、というところまでを作っています。
+構成:
+  App           ... ウィンドウ本体。2つの画面を持ち、切り替える。
+                    キャプチャ処理との接続口(set_handlers / packet_queue)もここ。
+  TitleScreen   ... 最初の画面(種類とインターフェースの選択)
+  CaptureScreen ... パケット一覧・詳細・状態表示の画面
+  DummyCapture  ... チームのキャプチャ処理の代役(本物ができたら差し替える)
 
-まだ実際のパケットキャプチャ処理(pyshark等)は入っていません。
-下にある on_start_capture() 関数の中身を、後で実際の処理に差し替えれば
-そのままアプリとして動く構成にしてあります。
-
-【今回の方針:全画面サイズ固定】
-このアプリは全画面専用として使う想定なので、
-- 起動時に「今使っているモニターの画面サイズ」を取得する
-- そのサイズと、デザインの基準サイズ(BASE_WINDOW_W/H)を比較して
-  拡大率(scale)を1回だけ計算する
-- 計算した拡大率で全部品(文字・カード・ボタン等)のサイズを決めて配置する
-- resizable(False, False) でユーザーがリサイズできないようにする
-という作りにしています。ウィンドウリサイズを監視する仕組み(on_resize等)は
-不要になったため、前回のバージョンからは削除しています。
+画面の流れ:
+  TitleScreen で「キャプチャ開始」
+      -> App.show_capture(種類, インターフェース)
+      -> CaptureScreen に切り替わり、自動でキャプチャ開始
+  CaptureScreen の「戻る」
+      -> キャプチャ停止 -> TitleScreen に戻る
 """
+
+import queue
+import random
+import threading
+from datetime import datetime
+from tkinter import ttk
 
 import customtkinter
 
@@ -29,20 +33,21 @@ import customtkinter
 FONT_TYPE = "Noto Sans CJK JP"
 
 # デザインを作ったときの「基準サイズ」。
-# 実際の画面がこれより大きければ拡大、小さければ縮小、という計算のもとになる。
 BASE_WINDOW_W = 760
 BASE_WINDOW_H = 620
 
-# 今回のターゲット画面サイズ:フルHD固定。
-# 動作させるPCのモニターがフルHD(1920x1080)である前提で、常にこのサイズで
-# ウィンドウを開く。モニターがこれより小さい環境で動かすと、ウィンドウが
-# 画面からはみ出す点に注意(その場合は自動検出方式に戻すのがおすすめ)。
+# ターゲット画面サイズ:フルHD固定。
 TARGET_WINDOW_W = 1920
 TARGET_WINDOW_H = 1080
 
-# 拡大率の上限・下限(文字が潰れたり間延びしすぎたりしないための保険)
+# 拡大率の上限・下限
 MIN_SCALE = 0.85
 MAX_SCALE = 2.2
+
+# パケット一覧(Treeview)の文字サイズと行の高さの「基準値」。
+# 実際に見て大きすぎ/小さすぎたら、ここの数字を変えて調整する。
+TREE_FONT_BASE = 8
+TREE_ROW_BASE = 20
 
 CAPTURE_TYPES = {
     "wifi": {
@@ -78,45 +83,28 @@ DUMMY_INTERFACES = {
 }
 
 
-class App(customtkinter.CTk):
-    def __init__(self):
-        super().__init__()
+# ============================================================
+# 画面1: タイトル画面(キャプチャ種類の選択)
+# ============================================================
+class TitleScreen(customtkinter.CTkFrame):
+    def __init__(self, master, ui_scale, on_start):
+        # fg_color="transparent" にして、ウィンドウの背景色と同じ見た目にする
+        super().__init__(master, fg_color="transparent")
 
-        # ---- メンバー変数 ----
+        self.ui_scale = ui_scale
+        self.on_start = on_start  # (種類, インターフェース) を受け取る関数。Appが渡してくる
         self.selected_type = None
         self.card_widgets = {}
-
-        customtkinter.set_appearance_mode("dark")
-        customtkinter.set_default_color_theme("blue")
-
-        # ---- フルHD(1920x1080)を前提に拡大率を1回だけ計算する ----
-        scale_w = TARGET_WINDOW_W / BASE_WINDOW_W
-        scale_h = TARGET_WINDOW_H / BASE_WINDOW_H
-        self.scale = max(MIN_SCALE, min(MAX_SCALE, min(scale_w, scale_h)))
-
-        # ---- ウィンドウをフルHDサイズに固定する ----
-        # 実際のモニターサイズ(winfo_screenwidth/height)は、ウィンドウを
-        # 画面の真ん中に置くための位置決めにだけ使う。サイズ自体は
-        # 1920x1080で固定なので、モニターがフルHDより小さいとウィンドウの
-        # 一部が画面からはみ出す点は留意しておくこと。
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
-        pos_x = max(0, (screen_w - TARGET_WINDOW_W) // 2)
-        pos_y = max(0, (screen_h - TARGET_WINDOW_H) // 2)
-
-        self.geometry(f"{TARGET_WINDOW_W}x{TARGET_WINDOW_H}+{pos_x}+{pos_y}")
-        self.resizable(False, False)  # ユーザーによるリサイズを禁止
-        self.title("学習パケットアナライザ")
 
         self.setup_fonts()
         self.setup_form()
 
     # ------------------------------------------------------------
-    # 拡大率(self.scale)を反映したフォントを用意する。
+    # 拡大率を反映したフォントを用意する。
     # ------------------------------------------------------------
     def scaled(self, base_size):
-        """基準サイズに拡大率をかけて、整数のフォントサイズを返す小さなヘルパー"""
-        return round(base_size * self.scale)
+        """基準サイズに拡大率をかけて、整数のサイズを返す小さなヘルパー"""
+        return round(base_size * self.ui_scale)
 
     def setup_fonts(self):
         self.font_title = customtkinter.CTkFont(
@@ -148,8 +136,7 @@ class App(customtkinter.CTk):
     # 画面レイアウトの組み立て
     # ------------------------------------------------------------
     def setup_form(self):
-        # 上下の行を weight=1 にして、画面いっぱいのウィンドウの中でも
-        # 中身が縦方向の真ん中に来るようにする。
+        # 上下の行を weight=1 にして、中身が縦方向の真ん中に来るようにする。
         self.grid_rowconfigure(0, weight=1)
         self.grid_rowconfigure(8, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -309,22 +296,367 @@ class App(customtkinter.CTk):
 
         selected_interface = self.interface_menu.get()
 
-        # ==========================================================
-        # ここが「後で中身を実装する」ポイント。
-        #
-        #   import pyshark
-        #   capture = pyshark.LiveCapture(interface=selected_interface)
-        #   for packet in capture.sniff_continuously():
-        #       ...受け取ったpacketを一覧画面に渡す処理...
-        #
-        # 「ログ読み込み」が選ばれた場合は pyshark.FileCapture(ファイルパス)
-        # を使う形になるはず。
-        # ==========================================================
-        print(f"選択された種類: {self.selected_type}")
-        print(f"選択されたインターフェース: {selected_interface}")
-        print("※ここに実際のキャプチャ処理を実装していきます")
+        # 実際の画面切り替えとキャプチャ開始は App 側がやる。
+        # (「ログ読み込み」のときのファイル選択などは、今後ここで追加する)
+        self.on_start(self.selected_type, selected_interface)
+
+
+# ============================================================
+# 画面2: パケット一覧画面
+# ============================================================
+class CaptureScreen(customtkinter.CTkFrame):
+    def __init__(self, master, ui_scale, packet_queue, on_start, on_stop, on_back):
+        super().__init__(master, fg_color="transparent")
+
+        self.ui_scale = ui_scale
+        self.packet_queue = packet_queue
+        self.on_start_callback = on_start  # (種類, インターフェース, フィルタ文字列)
+        self.on_stop_callback = on_stop    # 引数なし
+        self.on_back_callback = on_back    # 引数なし
+
+        self.capture_type = None
+        self.interface = None
+        self.details = {}  # 行の番号 -> 詳細テキスト
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=3)  # 一覧エリア(大きめ)
+        self.grid_rowconfigure(2, weight=1)  # 詳細エリア(小さめ)
+
+        self.setup_fonts()
+        self.create_toolbar()
+        self.create_packet_list()
+        self.create_detail_pane()
+        self.create_statusbar()
+
+        # 0.1秒ごとにキューを確認し始める(以降、自分で繰り返す)
+        self.after(100, self.process_queue)
+
+    def scaled(self, base_size):
+        return round(base_size * self.ui_scale)
+
+    def setup_fonts(self):
+        self.font_button = customtkinter.CTkFont(
+            family=FONT_TYPE, size=self.scaled(15), weight="bold"
+        )
+        self.font_body = customtkinter.CTkFont(
+            family=FONT_TYPE, size=self.scaled(14)
+        )
+
+    # ========== 画面の部品を作るメソッド ==========
+    def create_toolbar(self):
+        self.toolbar = customtkinter.CTkFrame(self)
+        self.toolbar.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
+
+        self.back_button = customtkinter.CTkButton(
+            self.toolbar,
+            text="◀ 戻る",
+            font=self.font_button,
+            height=self.scaled(40),
+            width=self.scaled(100),
+            fg_color="gray30",
+            hover_color="gray40",
+            command=self.go_back,
+        )
+        self.back_button.pack(side="left", padx=5, pady=5)
+
+        self.start_button = customtkinter.CTkButton(
+            self.toolbar,
+            text="開始",
+            font=self.font_button,
+            height=self.scaled(40),
+            command=self.start_capture,
+        )
+        self.start_button.pack(side="left", padx=5, pady=5)
+
+        self.stop_button = customtkinter.CTkButton(
+            self.toolbar,
+            text="停止",
+            font=self.font_button,
+            height=self.scaled(40),
+            command=self.stop_capture,
+        )
+        self.stop_button.pack(side="left", padx=5, pady=5)
+
+        self.filter_entry = customtkinter.CTkEntry(
+            self.toolbar,
+            placeholder_text="フィルタ（例: tcp, port 80）",
+            font=self.font_body,
+            height=self.scaled(40),
+        )
+        self.filter_entry.pack(side="left", padx=5, pady=5, fill="x", expand=True)
+
+    def create_packet_list(self):
+        self.main_frame = customtkinter.CTkFrame(self)
+        self.main_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        self.main_frame.grid_rowconfigure(0, weight=1)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+
+        self.setup_treeview_style()
+
+        columns = ("No", "Time", "src", "dst", "Protocol")
+        self.tree = ttk.Treeview(self.main_frame, columns=columns, show="headings")
+
+        self.tree.heading("No", text="No.")
+        self.tree.heading("Time", text="時刻")
+        self.tree.heading("src", text="送信元")
+        self.tree.heading("dst", text="宛先")
+        self.tree.heading("Protocol", text="プロトコル")
+
+        self.tree.column("No", width=self.scaled(60), anchor="center")
+        self.tree.column("Time", width=self.scaled(150))
+        self.tree.column("src", width=self.scaled(150))
+        self.tree.column("dst", width=self.scaled(150))
+        self.tree.column("Protocol", width=self.scaled(100), anchor="center")
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(
+            self.main_frame, orient="vertical", command=self.tree.yview
+        )
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        # 行が選ばれたときに on_select を呼ぶ
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+
+    def create_detail_pane(self):
+        self.detail_box = customtkinter.CTkTextbox(self, font=self.font_body)
+        self.detail_box.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
+        self.detail_box.configure(state="disabled")  # 読み取り専用
+
+    def create_statusbar(self):
+        self.status_label = customtkinter.CTkLabel(
+            self, text="状態: 停止中", anchor="w", font=self.font_body
+        )
+        self.status_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+    def setup_treeview_style(self):
+        font_size = self.scaled(TREE_FONT_BASE)
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure(
+            "Treeview",
+            background="#2a2d2e",
+            foreground="white",
+            fieldbackground="#2a2d2e",
+            rowheight=self.scaled(TREE_ROW_BASE),
+            borderwidth=0,
+            font=(FONT_TYPE, font_size),
+        )
+        style.configure(
+            "Treeview.Heading",
+            background="#565b5e",
+            foreground="white",
+            borderwidth=0,
+            font=(FONT_TYPE, font_size, "bold"),
+        )
+        style.map("Treeview", background=[("selected", "#22559b")])
+
+    # ========== 開始・停止・戻る ==========
+    def begin(self, capture_type, interface):
+        """この画面に切り替わったときに App から呼ばれる。選択内容を覚えて、すぐ開始する"""
+        self.capture_type = capture_type
+        self.interface = interface
+        self.start_capture()
+
+    def start_capture(self):
+        self.clear_packets()
+        self.update_status(running=True)
+        self.on_start_callback(
+            self.capture_type, self.interface, self.filter_entry.get()
+        )
+
+    def stop_capture(self):
+        self.update_status(running=False)
+        self.on_stop_callback()
+
+    def go_back(self):
+        self.stop_capture()
+        self.on_back_callback()
+
+    def update_status(self, running):
+        """状態表示と、ボタンの押せる/押せないを切り替える"""
+        state_text = "キャプチャ中" if running else "停止中"
+        info = CAPTURE_TYPES.get(self.capture_type, {}).get("label", "")
+        self.status_label.configure(
+            text=f"状態: {state_text}　|　{info}: {self.interface}"
+        )
+        # キャプチャ中は「開始」を押せなくする(二重開始の防止)
+        self.start_button.configure(state="disabled" if running else "normal")
+        self.stop_button.configure(state="normal" if running else "disabled")
+
+    # ========== 一覧の操作(UIの流れの中だけで呼ぶ) ==========
+    def add_packet(self, no, time, src, dst, protocol, detail=""):
+        """パケット1件を一覧に追加する"""
+        iid = str(no)
+        self.tree.insert("", "end", iid=iid, values=(no, time, src, dst, protocol))
+        self.details[iid] = detail
+        self.tree.see(iid)  # 常に最新の行までスクロール
+
+    def clear_packets(self):
+        """一覧を空にする。キューに残っている古いパケットも捨てる"""
+        self.tree.delete(*self.tree.get_children())
+        self.details.clear()
+        while True:
+            try:
+                self.packet_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def process_queue(self):
+        """キューに溜まったパケットを全部取り出して表示する。0.1秒ごとに自分で再実行"""
+        try:
+            while True:
+                packet = self.packet_queue.get_nowait()
+                self.add_packet(**packet)
+        except queue.Empty:
+            pass
+        finally:
+            # 途中でエラーが起きても、次の確認はちゃんと予約する
+            self.after(100, self.process_queue)
+
+    # ========== 行を選んだときの処理 ==========
+    def on_select(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        text = self.details.get(selected[0], "")
+
+        self.detail_box.configure(state="normal")
+        self.detail_box.delete("1.0", "end")
+        self.detail_box.insert("1.0", text)
+        self.detail_box.configure(state="disabled")
+
+
+# ============================================================
+# ウィンドウ本体
+# ============================================================
+class App(customtkinter.CTk):
+    def __init__(self):
+        super().__init__()
+
+        customtkinter.set_appearance_mode("dark")
+        customtkinter.set_default_color_theme("blue")
+
+        # ---- フルHDを前提に拡大率を1回だけ計算する ----
+        scale_w = TARGET_WINDOW_W / BASE_WINDOW_W
+        scale_h = TARGET_WINDOW_H / BASE_WINDOW_H
+        self.ui_scale = max(MIN_SCALE, min(MAX_SCALE, min(scale_w, scale_h)))
+
+        # ---- ウィンドウをフルHDサイズに固定して、画面の真ん中に置く ----
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        pos_x = max(0, (screen_w - TARGET_WINDOW_W) // 2)
+        pos_y = max(0, (screen_h - TARGET_WINDOW_H) // 2)
+
+        self.geometry(f"{TARGET_WINDOW_W}x{TARGET_WINDOW_H}+{pos_x}+{pos_y}")
+        self.resizable(False, False)
+        self.title("学習パケットアナライザ")
+
+        # ---- キャプチャ処理との接続口 ----
+        self.packet_queue = queue.Queue()  # キャプチャ側はここに put する
+        self.on_start_callback = None
+        self.on_stop_callback = None
+
+        # ---- 2つの画面を作る(同じ場所に重ねて、片方だけ表示する) ----
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self.title_screen = TitleScreen(
+            self, self.ui_scale, on_start=self.show_capture
+        )
+        self.capture_screen = CaptureScreen(
+            self,
+            self.ui_scale,
+            self.packet_queue,
+            on_start=self._handle_start,
+            on_stop=self._handle_stop,
+            on_back=self.show_title,
+        )
+
+        self.show_title()
+
+    # ========== 画面の切り替え ==========
+    def _show(self, screen):
+        self.title_screen.grid_forget()
+        self.capture_screen.grid_forget()
+        screen.grid(row=0, column=0, sticky="nsew")
+
+    def show_title(self):
+        self._show(self.title_screen)
+
+    def show_capture(self, capture_type, interface):
+        self._show(self.capture_screen)
+        self.capture_screen.begin(capture_type, interface)
+
+    # ========== チームとの接続口 ==========
+    def set_handlers(self, on_start, on_stop):
+        """開始/停止のときに呼ぶ関数を登録する
+
+        on_start(capture_type, interface, filter_text)
+        on_stop()
+        """
+        self.on_start_callback = on_start
+        self.on_stop_callback = on_stop
+
+    def _handle_start(self, capture_type, interface, filter_text):
+        if self.on_start_callback:
+            self.on_start_callback(capture_type, interface, filter_text)
+
+    def _handle_stop(self):
+        if self.on_stop_callback:
+            self.on_stop_callback()
+
+
+# ============================================================
+# チームの代役(あとで本物に差し替える)
+# ============================================================
+class DummyCapture:
+    def __init__(self, packet_queue):
+        self.packet_queue = packet_queue
+        self._stop_event = None
+
+    def start(self, capture_type, interface, filter_text=""):
+        # すでに動いているなら何もしない
+        if self._stop_event is not None and not self._stop_event.is_set():
+            return
+        # 開始のたびに新しい「止めるための旗」を作る。
+        # 古いスレッドは古い旗で止まるので、素早く停止→開始しても混ざらない。
+        self._stop_event = threading.Event()
+        threading.Thread(
+            target=self._run,
+            args=(self._stop_event, capture_type, interface),
+            daemon=True,
+        ).start()
+
+    def stop(self):
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+    def _run(self, stop_event, capture_type, interface):
+        no = 1
+        while not stop_event.is_set():
+            protocol = random.choice(["TCP", "UDP", "DNS", "TLS"])
+            packet = {
+                "no": no,
+                "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                "src": f"192.168.1.{random.randint(2, 50)}",
+                "dst": f"10.0.0.{random.randint(2, 50)}",
+                "protocol": protocol,
+                "detail": (
+                    f"{protocol} パケット\n"
+                    f"  番号: {no}\n"
+                    f"  キャプチャ種類: {capture_type}\n"
+                    f"  インターフェース: {interface}"
+                ),
+            }
+            self.packet_queue.put(packet)  # 画面は触らず、キューに入れるだけ
+            no += 1
+            stop_event.wait(0.5)  # 0.5秒待つ。stop されたらすぐ起きる
 
 
 if __name__ == "__main__":
     app = App()
+    capture = DummyCapture(app.packet_queue)
+    app.set_handlers(on_start=capture.start, on_stop=capture.stop)
     app.mainloop()
